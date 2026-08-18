@@ -124,10 +124,14 @@ else
     pct_used=0
 fi
 
-effort="default"
-settings_path="$HOME/.claude/settings.json"
-if [ -f "$settings_path" ]; then
-    effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
+# payload .effort.level is the live value (/effort overrides); settings.json is the fallback
+effort=$(echo "$input" | jq -r '.effort.level // empty')
+if [ -z "$effort" ]; then
+    effort="default"
+    settings_path="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+    if [ -f "$settings_path" ]; then
+        effort=$(jq -r '.effortLevel // "default"' "$settings_path" 2>/dev/null)
+    fi
 fi
 
 # ── LINE 1: Model │ Context % │ Directory (branch) │ Session │ Effort ──
@@ -145,20 +149,16 @@ if git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     fi
 fi
 
+# ponytail: payload has no .session.start_time -- cost.total_duration_ms is the real wall clock
 session_duration=""
-session_start=$(echo "$input" | jq -r '.session.start_time // empty')
-if [ -n "$session_start" ] && [ "$session_start" != "null" ]; then
-    start_epoch=$(iso_to_epoch "$session_start")
-    if [ -n "$start_epoch" ]; then
-        now_epoch=$(date +%s)
-        elapsed=$(( now_epoch - start_epoch ))
-        if [ "$elapsed" -ge 3600 ]; then
-            session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
-        elif [ "$elapsed" -ge 60 ]; then
-            session_duration="$(( elapsed / 60 ))m"
-        else
-            session_duration="${elapsed}s"
-        fi
+elapsed=$(echo "$input" | jq -r '((.cost.total_duration_ms // 0) / 1000) | floor')
+if [ "$elapsed" -gt 0 ] 2>/dev/null; then
+    if [ "$elapsed" -ge 3600 ]; then
+        session_duration="$(( elapsed / 3600 ))h$(( (elapsed % 3600) / 60 ))m"
+    elif [ "$elapsed" -ge 60 ]; then
+        session_duration="$(( elapsed / 60 ))m"
+    else
+        session_duration="${elapsed}s"
     fi
 fi
 
@@ -180,13 +180,50 @@ if [ -n "$session_duration" ]; then
     line1+="${sep}"
     line1+="${dim}⏱ ${reset}${white}${session_duration}${reset}"
 fi
+if [ "$(echo "$input" | jq -r '.fast_mode // false')" = "true" ]; then
+    line1+="${sep}${yellow}⚡ fast${reset}"
+fi
+if [ "$(echo "$input" | jq -r '.thinking.enabled == false')" = "true" ]; then
+    line1+="${sep}${dim}🧠 off${reset}"
+fi
+if [ "$(echo "$input" | jq -r '.exceeds_200k_tokens // false')" = "true" ]; then
+    line1+="${sep}${magenta}1M${reset}"
+fi
 line1+="${sep}"
 case "$effort" in
-    high)   line1+="${magenta}● ${effort}${reset}" ;;
+    max|xhigh|high) line1+="${magenta}● ${effort}${reset}" ;;
     medium) line1+="${dim}◑ ${effort}${reset}" ;;
     low)    line1+="${dim}◔ ${effort}${reset}" ;;
     *)      line1+="${dim}◑ ${effort}${reset}" ;;
 esac
+
+# ── LINE 2: cost │ lines ± │ api time │ pr │ worktree │ style │ version ──
+cost_usd=$(echo "$input" | jq -r '.cost.total_cost_usd // 0' | awk '{printf "%.2f", $1}')
+lines_add=$(echo "$input" | jq -r '.cost.total_lines_added // 0')
+lines_del=$(echo "$input" | jq -r '.cost.total_lines_removed // 0')
+api_s=$(echo "$input" | jq -r '((.cost.total_api_duration_ms // 0) / 1000) | floor')
+
+line2="${dim}\$${reset}${white}${cost_usd}${reset}"
+line2+="${sep}${green}+${lines_add}${reset}${dim}/${reset}${red}-${lines_del}${reset}"
+line2+="${sep}${dim}api${reset} ${white}${api_s}s${reset}"
+
+pr_number=$(echo "$input" | jq -r '.pr.number // empty')
+if [ -n "$pr_number" ]; then
+    pr_state=$(echo "$input" | jq -r '.pr.review_state // empty')
+    line2+="${sep}${magenta}PR #${pr_number}${reset}"
+    [ -n "$pr_state" ] && line2+=" ${dim}${pr_state}${reset}"
+fi
+
+wt_name=$(echo "$input" | jq -r '.worktree.name // .workspace.git_worktree // empty')
+[ -n "$wt_name" ] && line2+="${sep}${cyan}⑂ ${wt_name}${reset}"
+
+style=$(echo "$input" | jq -r '.output_style.name // empty')
+[ -n "$style" ] && [ "$style" != "default" ] && line2+="${sep}${dim}${style}${reset}"
+
+sess_name=$(echo "$input" | jq -r '.session_name // empty')
+[ -n "$sess_name" ] && line2+="${sep}${white}${sess_name}${reset}"
+
+line2+="${sep}${dim}v$(echo "$input" | jq -r '.version // "?"')${reset}"
 
 # ── Rate limits from stdin (primary) ───────────────────
 has_stdin_rates=false
@@ -204,7 +241,7 @@ if [ -n "$stdin_five_pct" ]; then
     seven_day_reset_epoch=$(echo "$input" | jq -r '.rate_limits.seven_day.resets_at // empty')
 fi
 
-# ── Fallback: API call (cached) ────────────────────────
+# ── Usage API (cached) — always fetched: stdin only carries 5h/7d ──
 cache_file="/tmp/claude/statusline-usage-cache.json"
 cache_max_age=60
 mkdir -p /tmp/claude
@@ -212,7 +249,7 @@ mkdir -p /tmp/claude
 usage_data=""
 extra_enabled="false"
 
-if ! $has_stdin_rates; then
+if true; then
     needs_refresh=true
 
     if [ -f "$cache_file" ]; then
@@ -229,16 +266,19 @@ if ! $has_stdin_rates; then
         token=""
         if [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
             token="$CLAUDE_CODE_OAUTH_TOKEN"
-        elif command -v security >/dev/null 2>&1; then
-            blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
-            if [ -n "$blob" ]; then
-                token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+        fi
+        if [ -z "$token" ] || [ "$token" = "null" ]; then
+            creds_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+            if [ -f "$creds_file" ]; then
+                token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
             fi
         fi
         if [ -z "$token" ] || [ "$token" = "null" ]; then
-            creds_file="${HOME}/.claude/.credentials.json"
-            if [ -f "$creds_file" ]; then
-                token=$(jq -r '.claudeAiOauth.accessToken // empty' "$creds_file" 2>/dev/null)
+            if command -v security >/dev/null 2>&1; then
+                blob=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)
+                if [ -n "$blob" ]; then
+                    token=$(echo "$blob" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+                fi
             fi
         fi
         if [ -z "$token" ] || [ "$token" = "null" ]; then
@@ -269,21 +309,16 @@ if ! $has_stdin_rates; then
     fi
 
     if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-        five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
-        five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
-        five_hour_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
-        seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
-        seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
-        seven_day_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
+        if ! $has_stdin_rates; then
+            five_hour_pct=$(echo "$usage_data" | jq -r '.five_hour.utilization // 0' | awk '{printf "%.0f", $1}')
+            five_hour_reset_iso=$(echo "$usage_data" | jq -r '.five_hour.resets_at // empty')
+            five_hour_reset_epoch=$(iso_to_epoch "$five_hour_reset_iso")
+            seven_day_pct=$(echo "$usage_data" | jq -r '.seven_day.utilization // 0' | awk '{printf "%.0f", $1}')
+            seven_day_reset_iso=$(echo "$usage_data" | jq -r '.seven_day.resets_at // empty')
+            seven_day_reset_epoch=$(iso_to_epoch "$seven_day_reset_iso")
+        fi
 
         extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
-    fi
-else
-    if [ -f "$cache_file" ]; then
-        usage_data=$(cat "$cache_file" 2>/dev/null)
-        if [ -n "$usage_data" ] && echo "$usage_data" | jq -e . >/dev/null 2>&1; then
-            extra_enabled=$(echo "$usage_data" | jq -r '.extra_usage.is_enabled // false')
-        fi
     fi
 fi
 
@@ -298,7 +333,7 @@ if [ -n "$five_hour_pct" ]; then
     five_hour_pct_fmt=$(printf "%3d" "$five_hour_pct")
 
     rate_lines+="${white}current${reset} ${five_hour_bar} ${five_hour_pct_color}${five_hour_pct_fmt}%${reset}"
-    [ -n "$five_hour_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${five_hour_reset}${reset}"
+    [ -n "$five_hour_reset" ] && rate_lines+=" ${dim}⟳${reset}  ${white}${five_hour_reset}${reset}"
 fi
 
 if [ -n "$seven_day_pct" ]; then
@@ -309,7 +344,23 @@ if [ -n "$seven_day_pct" ]; then
 
     [ -n "$rate_lines" ] && rate_lines+="\n"
     rate_lines+="${white}weekly${reset}  ${seven_day_bar} ${seven_day_pct_color}${seven_day_pct_fmt}%${reset}"
-    [ -n "$seven_day_reset" ] && rate_lines+=" ${dim}⟳${reset} ${white}${seven_day_reset}${reset}"
+    [ -n "$seven_day_reset" ] && rate_lines+=" ${dim}⟳${reset}  ${white}${seven_day_reset}${reset}"
+fi
+
+# per-model weekly caps (Fable/Opus…) — only the usage API has these, stdin does not
+if [ -n "$usage_data" ]; then
+    while IFS=$'\t' read -r sc_name sc_pct sc_reset; do
+        [ -z "$sc_name" ] && continue
+        sc_pct=$(printf "%.0f" "$sc_pct")
+        sc_bar=$(build_bar "$sc_pct" "$bar_width")
+        sc_color=$(color_for_pct "$sc_pct")
+        sc_when=$(format_epoch_time "$(iso_to_epoch "$sc_reset")" "datetime")
+        sc_label=$(printf "%-7s" "$(echo "$sc_name" | tr '[:upper:]' '[:lower:]')")
+
+        [ -n "$rate_lines" ] && rate_lines+="\n"
+        rate_lines+="${white}${sc_label}${reset} ${sc_bar} ${sc_color}$(printf "%3d" "$sc_pct")%${reset}"
+        [ -n "$sc_when" ] && rate_lines+=" ${dim}⟳${reset}  ${white}${sc_when}${reset}"
+    done < <(echo "$usage_data" | jq -r '.limits[]? | select(.kind == "weekly_scoped") | [(.scope.model.display_name // "scoped"), (.percent // 0), (.resets_at // "")] | @tsv')
 fi
 
 if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
@@ -325,11 +376,12 @@ if [ "$extra_enabled" = "true" ] && [ -n "$usage_data" ]; then
     fi
 
     [ -n "$rate_lines" ] && rate_lines+="\n"
-    rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset} ${white}${extra_reset}${reset}"
+    rate_lines+="${white}extra${reset}   ${extra_bar} ${extra_pct_color}\$${extra_used}${dim}/${reset}${white}\$${extra_limit}${reset} ${dim}⟳${reset}  ${white}${extra_reset}${reset}"
 fi
 
 # ── Output ──────────────────────────────────────────────
 printf "%b" "$line1"
+printf "\n%b" "$line2"
 [ -n "$rate_lines" ] && printf "\n\n%b" "$rate_lines"
 
 exit 0
